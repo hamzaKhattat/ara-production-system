@@ -99,19 +99,19 @@ func runServerMode() {
    
    // Initialize database if requested
    if initDB {
-       logger.Info("Initializing database schema")
-       if err := db.RunMigrations(database.DB); err != nil {
-           logger.Fatal("Failed to run migrations", "error", err)
-       }
-       
-       // Create initial dialplan
-       if err := araManager.CreateDialplan(ctx); err != nil {
-           logger.Fatal("Failed to create dialplan", "error", err)
-       }
-       
-       logger.Info("Database initialization completed")
-       return
-   }
+    logger.Info("Initializing database schema")
+    if err := db.RunDatabaseMigrations(database.DB); err != nil {
+        logger.Fatal("Failed to run migrations", "error", err)
+    }
+    
+    // Create initial dialplan
+    if err := araManager.CreateDialplan(ctx); err != nil {
+        logger.Fatal("Failed to create dialplan", "error", err)
+    }
+    
+    logger.Info("Database initialization completed")
+    return
+}
    
    // Run AGI server if requested
    if agiMode {

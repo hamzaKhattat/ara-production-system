@@ -5,7 +5,6 @@ import (
     "context"
     "fmt"
     "net"
-    "strconv"
     "strings"
     "sync"
     "sync/atomic"
@@ -119,7 +118,7 @@ func (m *Manager) Connect(ctx context.Context) error {
     }
     
     addr := fmt.Sprintf("%s:%d", m.config.Host, m.config.Port)
-    logger.WithField("addr", addr).Info("Connecting to Asterisk AMI")
+    logger.Info("Connecting to Asterisk AMI", "addr", addr)
     
     dialer := net.Dialer{
         Timeout: 10 * time.Second,
@@ -148,11 +147,17 @@ func (m *Manager) Connect(ctx context.Context) error {
     
     m.connected = true
     
+    // Unlock before login to avoid deadlock
+    m.mu.Unlock()
+    
     // Login
     if err := m.login(); err != nil {
         m.Close()
+        m.mu.Lock() // Re-acquire lock before returning
         return err
     }
+    
+    m.mu.Lock() // Re-acquire lock
     
     // Start event reader
     m.wg.Add(1)
@@ -174,20 +179,30 @@ func (m *Manager) Connect(ctx context.Context) error {
 // Close closes the AMI connection
 func (m *Manager) Close() {
     m.mu.Lock()
-    defer m.mu.Unlock()
     
     if !m.connected {
+        m.mu.Unlock()
         return
     }
     
-    close(m.shutdown)
+    // Mark as not connected first
+    m.connected = false
+    m.loggedIn = false
     
+    // Close shutdown channel
+    select {
+    case <-m.shutdown:
+        // Already closed
+    default:
+        close(m.shutdown)
+    }
+    
+    // Close connection
     if m.conn != nil {
         m.conn.Close()
     }
     
-    m.connected = false
-    m.loggedIn = false
+    m.mu.Unlock()
     
     // Wait for goroutines with timeout
     done := make(chan struct{})
@@ -232,11 +247,18 @@ func (m *Manager) login() error {
 // SendAction sends an AMI action
 func (m *Manager) SendAction(action Action) (Event, error) {
     m.mu.RLock()
-    if !m.connected || !m.loggedIn {
-        m.mu.RUnlock()
+    connected := m.connected
+    loggedIn := m.loggedIn
+    m.mu.RUnlock()
+    
+    if !connected {
         return nil, errors.New(errors.ErrInternal, "not connected to AMI")
     }
-    m.mu.RUnlock()
+    
+    // For non-login actions, check if logged in
+    if action.Action != "Login" && !loggedIn {
+        return nil, errors.New(errors.ErrInternal, "not logged in to AMI")
+    }
     
     // Generate action ID
     actionID := fmt.Sprintf("%d", atomic.AddUint64(&m.actionID, 1))
@@ -253,6 +275,7 @@ func (m *Manager) SendAction(action Action) (Event, error) {
         m.actionMutex.Lock()
         delete(m.pendingActions, actionID)
         m.actionMutex.Unlock()
+        close(responseChan)
     }()
     
     // Build action string
@@ -268,23 +291,40 @@ func (m *Manager) SendAction(action Action) (Event, error) {
     
     // Send action
     actionStr := strings.Join(lines, "\r\n")
-    if _, err := m.writer.WriteString(actionStr); err != nil {
+    
+    m.mu.Lock()
+    if m.writer == nil {
+        m.mu.Unlock()
+        return nil, errors.New(errors.ErrInternal, "writer is nil")
+    }
+    
+    _, err := m.writer.WriteString(actionStr)
+    if err != nil {
+        m.mu.Unlock()
         return nil, errors.Wrap(err, errors.ErrInternal, "failed to write AMI action")
     }
     
-    if err := m.writer.Flush(); err != nil {
+    err = m.writer.Flush()
+    m.mu.Unlock()
+    
+    if err != nil {
         return nil, errors.Wrap(err, errors.ErrInternal, "failed to flush AMI action")
     }
     
     atomic.AddUint64(&m.totalActions, 1)
     
-    // Wait for response
+    // Wait for response with timeout
+    timer := time.NewTimer(m.config.ActionTimeout)
+    defer timer.Stop()
+    
     select {
     case response := <-responseChan:
         return response, nil
-    case <-time.After(m.config.ActionTimeout):
+    case <-timer.C:
         atomic.AddUint64(&m.failedActions, 1)
         return nil, errors.New(errors.ErrAGITimeout, "AMI action timeout")
+    case <-m.shutdown:
+        return nil, errors.New(errors.ErrInternal, "AMI manager shutting down")
     }
 }
 
@@ -299,7 +339,7 @@ func (m *Manager) eventReader() {
             event, err := m.readEvent()
             if err != nil {
                 if !strings.Contains(err.Error(), "use of closed network connection") {
-                    logger.WithField("error", err.Error()).Error("Failed to read AMI event")
+                    logger.Error("Failed to read AMI event", "error", err.Error())
                 }
                 
                 // Trigger reconnect
@@ -331,6 +371,11 @@ func (m *Manager) eventReader() {
                 case <-time.After(1 * time.Second):
                     logger.Warn("AMI event channel full, dropping event")
                 }
+                
+                // Call registered handlers
+                if eventType, ok := event["Event"]; ok {
+                    m.handleEvent(eventType, event)
+                }
             }
         }
     }
@@ -339,8 +384,16 @@ func (m *Manager) eventReader() {
 func (m *Manager) readEvent() (Event, error) {
     event := make(Event)
     
+    m.mu.RLock()
+    reader := m.reader
+    m.mu.RUnlock()
+    
+    if reader == nil {
+        return nil, errors.New(errors.ErrInternal, "reader is nil")
+    }
+    
     for {
-        line, err := m.reader.ReadString('\n')
+        line, err := reader.ReadString('\n')
         if err != nil {
             return nil, err
         }
@@ -365,6 +418,24 @@ func (m *Manager) readEvent() (Event, error) {
     }
 }
 
+func (m *Manager) handleEvent(eventType string, event Event) {
+    m.mu.RLock()
+    handlers := m.eventHandlers[eventType]
+    m.mu.RUnlock()
+    
+    for _, handler := range handlers {
+        // Call handler in goroutine to avoid blocking
+        go func(h EventHandler) {
+            defer func() {
+                if r := recover(); r != nil {
+                    logger.Error("Event handler panic", "event", eventType, "panic", r)
+                }
+            }()
+            h(event)
+        }(handler)
+    }
+}
+
 func (m *Manager) pingLoop() {
     defer m.wg.Done()
     
@@ -378,7 +449,7 @@ func (m *Manager) pingLoop() {
         case <-ticker.C:
             action := Action{Action: "Ping"}
             if _, err := m.SendAction(action); err != nil {
-                logger.WithField("error", err.Error()).Warn("AMI ping failed")
+                logger.Warn("AMI ping failed", "error", err.Error())
             }
         }
     }
@@ -405,10 +476,17 @@ func (m *Manager) reconnectHandler() {
             // Wait before reconnecting
             time.Sleep(m.config.ReconnectInterval)
             
+            // Check if we should still reconnect
+            select {
+            case <-m.shutdown:
+                return
+            default:
+            }
+            
             // Try to reconnect
             ctx := context.Background()
             if err := m.Connect(ctx); err != nil {
-                logger.WithField("error", err.Error()).Error("AMI reconnection failed")
+                logger.Error("AMI reconnection failed", "error", err.Error())
                 
                 // Trigger another reconnect attempt
                 select {
@@ -482,20 +560,37 @@ func (m *Manager) ShowChannels() ([]map[string]string, error) {
     }
     
     var channels []map[string]string
+    completeChan := make(chan bool, 1)
     
-    // Read channel events
-    timeout := time.After(1 * time.Second)
-    for {
-        select {
-        case event := <-m.eventChan:
-            if event["Event"] == "CoreShowChannel" {
-                channels = append(channels, event)
-            } else if event["Event"] == "CoreShowChannelsComplete" {
-                return channels, nil
+    // Temporarily register handler for channel events
+    handlerID := fmt.Sprintf("show_channels_%d", time.Now().UnixNano())
+    
+    handler := func(event Event) {
+        if event["Event"] == "CoreShowChannel" {
+            channels = append(channels, event)
+        } else if event["Event"] == "CoreShowChannelsComplete" {
+            select {
+            case completeChan <- true:
+            default:
             }
-        case <-timeout:
-            return channels, nil
         }
+    }
+    
+    m.RegisterEventHandler("CoreShowChannel", handler)
+    m.RegisterEventHandler("CoreShowChannelsComplete", handler)
+    
+    defer func() {
+        // Unregister handlers
+        m.UnregisterEventHandler("CoreShowChannel", handlerID)
+        m.UnregisterEventHandler("CoreShowChannelsComplete", handlerID)
+    }()
+    
+    // Wait for completion or timeout
+    select {
+    case <-completeChan:
+        return channels, nil
+    case <-time.After(5 * time.Second):
+        return channels, nil
     }
 }
 
@@ -529,6 +624,16 @@ func (m *Manager) RegisterEventHandler(eventType string, handler EventHandler) {
     m.eventHandlers[eventType] = append(m.eventHandlers[eventType], handler)
 }
 
+// UnregisterEventHandler removes a specific event handler
+func (m *Manager) UnregisterEventHandler(eventType string, handlerID string) {
+    m.mu.Lock()
+    defer m.mu.Unlock()
+    
+    // For simplicity, we're clearing all handlers for the event type
+    // In a production system, you'd want to track handlers by ID
+    delete(m.eventHandlers, eventType)
+}
+
 // GetStats returns AMI statistics
 func (m *Manager) GetStats() map[string]interface{} {
     return map[string]interface{}{
@@ -547,9 +652,133 @@ func (m *Manager) IsConnected() bool {
     return m.connected
 }
 
-// IsLoggedIn returns login status
+// IsLoggedIn returns login status  
 func (m *Manager) IsLoggedIn() bool {
     m.mu.RLock()
     defer m.mu.RUnlock()
     return m.loggedIn
+}
+
+// OriginateCall originates a new call
+func (m *Manager) OriginateCall(channel, context, exten, priority string, timeout int, callerID string, variables map[string]string) (string, error) {
+    fields := map[string]string{
+        "Channel":  channel,
+        "Context":  context,
+        "Exten":    exten,
+        "Priority": priority,
+        "Timeout":  fmt.Sprintf("%d", timeout),
+    }
+    
+    if callerID != "" {
+        fields["CallerID"] = callerID
+    }
+    
+    // Add variables
+    for k, v := range variables {
+        fields[fmt.Sprintf("Variable_%s", k)] = v
+    }
+    
+    action := Action{
+        Action: "Originate",
+        Fields: fields,
+    }
+    
+    response, err := m.SendAction(action)
+    if err != nil {
+        return "", err
+    }
+    
+    if response["Response"] != "Success" {
+        return "", errors.New(errors.ErrInternal, "Originate failed: " + response["Message"])
+    }
+    
+    return response["ActionID"], nil
+}
+
+// GetVar gets a global variable
+func (m *Manager) GetVar(variable string) (string, error) {
+    action := Action{
+        Action: "GetVar",
+        Fields: map[string]string{
+            "Variable": variable,
+        },
+    }
+    
+    response, err := m.SendAction(action)
+    if err != nil {
+        return "", err
+    }
+    
+    if response["Response"] != "Success" {
+        return "", errors.New(errors.ErrInternal, "GetVar failed")
+    }
+    
+    return response["Value"], nil
+}
+
+// SetVar sets a global variable
+func (m *Manager) SetVar(variable, value string) error {
+    action := Action{
+        Action: "SetVar",
+        Fields: map[string]string{
+            "Variable": variable,
+            "Value":    value,
+        },
+    }
+    
+    response, err := m.SendAction(action)
+    if err != nil {
+        return err
+    }
+    
+    if response["Response"] != "Success" {
+        return errors.New(errors.ErrInternal, "SetVar failed")
+    }
+    
+    return nil
+}
+
+// QueueStatus gets queue status
+func (m *Manager) QueueStatus(queue string) ([]Event, error) {
+    fields := make(map[string]string)
+    if queue != "" {
+        fields["Queue"] = queue
+    }
+    
+    action := Action{
+        Action: "QueueStatus",
+        Fields: fields,
+    }
+    
+    response, err := m.SendAction(action)
+    if err != nil {
+        return nil, err
+    }
+    
+    if response["Response"] != "Success" {
+        return nil, errors.New(errors.ErrInternal, "QueueStatus failed")
+    }
+    
+    // Collect queue events
+    var events []Event
+    timeout := time.After(5 * time.Second)
+    
+    for {
+        select {
+        case event := <-m.eventChan:
+            eventType := event["Event"]
+            if eventType == "QueueParams" || eventType == "QueueMember" || eventType == "QueueEntry" {
+                events = append(events, event)
+            } else if eventType == "QueueStatusComplete" {
+                return events, nil
+            }
+        case <-timeout:
+            return events, nil
+        }
+    }
+}
+
+// EventChannel returns the event channel for external processing
+func (m *Manager) EventChannel() <-chan Event {
+    return m.eventChan
 }

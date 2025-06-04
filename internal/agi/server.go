@@ -88,7 +88,7 @@ func (s *Server) Start() error {
     }
     
     s.listener = listener
-    logger.WithField("address", addr).Info("AGI server started")
+    logger.Info("AGI server started", "address", addr)
     
     // Start connection monitor
     go s.connectionMonitor()
@@ -112,7 +112,7 @@ func (s *Server) Start() error {
                 if s.shuttingDown.Load() {
                     return nil
                 }
-                logger.WithError(err).Warn("Failed to accept connection")
+                logger.Warn("Failed to accept connection", "error", err.Error())
                 continue
             }
             
@@ -197,10 +197,9 @@ func (s *Server) handleConnection(conn net.Conn) {
     conn.SetDeadline(time.Now().Add(s.config.ReadTimeout))
     
     // Log connection
-    logger.WithFields(logger.Fields{
-        "session_id": session.id,
-        "remote_addr": conn.RemoteAddr().String(),
-    }).Debug("New AGI connection")
+    logger.Debug("New AGI connection", 
+        "session_id", session.id,
+        "remote_addr", conn.RemoteAddr().String())
     
     // Update metrics
     s.metrics.IncrementCounter("agi_connections_total", nil)
@@ -209,16 +208,15 @@ func (s *Server) handleConnection(conn net.Conn) {
     // Handle session
     if err := session.handle(); err != nil {
         if err != io.EOF && !strings.Contains(err.Error(), "use of closed network connection") {
-            logger.WithError(err).WithField("session_id", session.id).Warn("Session error")
+            logger.Warn("Session error", "session_id", session.id, "error", err.Error())
         }
     }
     
     // Log session duration
     duration := time.Since(session.startTime)
-    logger.WithFields(logger.Fields{
-        "session_id": session.id,
-        "duration": duration.Seconds(),
-    }).Debug("AGI session completed")
+    logger.Debug("AGI session completed",
+        "session_id", session.id,
+        "duration", duration.Seconds())
     
     s.metrics.ObserveHistogram("agi_session_duration", duration.Seconds(), nil)
 }
@@ -241,12 +239,12 @@ func (session *Session) handle() error {
     session.ctx = context.WithValue(session.ctx, "call_id", session.headers["agi_uniqueid"])
     
     // Log request
-    logger.WithContext(session.ctx).WithFields(logger.Fields{
-        "request": request,
-        "channel": session.headers["agi_channel"],
-        "callerid": session.headers["agi_callerid"],
-        "extension": session.headers["agi_extension"],
-    }).Info("Processing AGI request")
+    log := logger.WithContext(session.ctx)
+    log.Info("Processing AGI request",
+        "request", request,
+        "channel", session.headers["agi_channel"],
+        "callerid", session.headers["agi_callerid"],
+        "extension", session.headers["agi_extension"])
     
     // Route request
     switch {
@@ -259,7 +257,7 @@ func (session *Session) handle() error {
     case strings.Contains(request, "hangup"):
         return session.handleHangup()
     default:
-        logger.WithContext(session.ctx).WithField("request", request).Warn("Unknown AGI request")
+        log.Warn("Unknown AGI request", "request", request)
         return session.sendResponse(AGIFailure)
     }
 }
@@ -313,13 +311,19 @@ func (session *Session) handleProcessIncoming() error {
     })
     
     if err != nil {
-        logger.WithContext(session.ctx).WithError(err).Error("Failed to process incoming call")
+        log := logger.WithContext(session.ctx)
+        log.Error("Failed to process incoming call", "error", err.Error())
         session.setVariable("ROUTER_STATUS", "failed")
         session.setVariable("ROUTER_ERROR", err.Error())
         
+        errorCode := "UNKNOWN_ERROR"
+        if appErr, ok := err.(*errors.AppError); ok {
+            errorCode = string(appErr.Code)
+        }
+        
         session.server.metrics.IncrementCounter("agi_requests_failed", map[string]string{
             "action": "process_incoming",
-            "error": errors.GetCode(err),
+            "error": errorCode,
         })
         
         return session.sendResponse(AGISuccess)
@@ -363,13 +367,19 @@ func (session *Session) handleProcessReturn() error {
     })
     
     if err != nil {
-        logger.WithContext(session.ctx).WithError(err).Error("Failed to process return call")
+        log := logger.WithContext(session.ctx)
+        log.Error("Failed to process return call", "error", err.Error())
         session.setVariable("ROUTER_STATUS", "failed")
         session.setVariable("ROUTER_ERROR", err.Error())
         
+        errorCode := "UNKNOWN_ERROR"
+        if appErr, ok := err.(*errors.AppError); ok {
+            errorCode = string(appErr.Code)
+        }
+        
         session.server.metrics.IncrementCounter("agi_requests_failed", map[string]string{
             "action": "process_return",
-            "error": errors.GetCode(err),
+            "error": errorCode,
         })
         
         return session.sendResponse(AGISuccess)
@@ -413,11 +423,17 @@ func (session *Session) handleProcessFinal() error {
     })
     
     if err != nil {
-        logger.WithContext(session.ctx).WithError(err).Error("Failed to process final call")
+        log := logger.WithContext(session.ctx)
+        log.Error("Failed to process final call", "error", err.Error())
+        
+        errorCode := "UNKNOWN_ERROR"
+        if appErr, ok := err.(*errors.AppError); ok {
+            errorCode = string(appErr.Code)
+        }
         
         session.server.metrics.IncrementCounter("agi_requests_failed", map[string]string{
             "action": "process_final",
-            "error": errors.GetCode(err),
+            "error": errorCode,
         })
     } else {
         session.server.metrics.IncrementCounter("agi_requests_success", map[string]string{
@@ -442,7 +458,8 @@ func (session *Session) handleHangup() error {
     })
     
     if err != nil {
-        logger.WithContext(session.ctx).WithError(err).Warn("Failed to process hangup")
+        log := logger.WithContext(session.ctx)
+        log.Warn("Failed to process hangup", "error", err.Error())
     }
     
     session.server.metrics.IncrementCounter("agi_requests_success", map[string]string{
@@ -465,11 +482,11 @@ func (session *Session) setVariable(name, value string) error {
         return err
     }
     
-    logger.WithContext(session.ctx).WithFields(logger.Fields{
-        "variable": name,
-        "value": value,
-        "response": response,
-    }).Debug("Set AGI variable")
+    log := logger.WithContext(session.ctx)
+    log.Debug("Set AGI variable",
+        "variable", name,
+        "value", value,
+        "response", response)
     
     return nil
 }
@@ -493,10 +510,10 @@ func (session *Session) getVariable(name string) string {
         end := strings.LastIndex(response, ")")
         if start > 0 && end > start {
             value := response[start+1 : end]
-            logger.WithContext(session.ctx).WithFields(logger.Fields{
-                "variable": name,
-                "value": value,
-            }).Debug("Got AGI variable")
+            log := logger.WithContext(session.ctx)
+            log.Debug("Got AGI variable",
+                "variable", name,
+                "value", value)
             return value
         }
     }
@@ -598,7 +615,7 @@ func (s *Server) checkIdleConnections() {
     
     for _, id := range toClose {
         if session, exists := s.activeConns[id]; exists {
-            logger.WithField("session_id", id).Info("Closing idle connection")
+            logger.Info("Closing idle connection", "session_id", id)
             session.conn.Close()
             session.cancel()
         }
@@ -610,8 +627,13 @@ func (s *Server) forceCloseConnections() {
     defer s.mu.Unlock()
     
     for id, session := range s.activeConns {
-        logger.WithField("session_id", id).Info("Force closing connection")
+        logger.Info("Force closing connection", "session_id", id)
         session.conn.Close()
         session.cancel()
     }
+}
+
+// GetRouter returns the router instance (for testing)
+func (s *Server) GetRouter() *router.Router {
+    return s.router
 }

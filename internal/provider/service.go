@@ -7,6 +7,7 @@ import (
     "fmt"
     "strings"
     "time"
+    "net"
     
     "github.com/hamzaKhattat/ara-production-system/internal/ara"
     "github.com/hamzaKhattat/ara-production-system/internal/ami"
@@ -119,7 +120,7 @@ func (s *Service) CreateProvider(ctx context.Context, provider *models.Provider)
     s.cache.Delete(ctx, fmt.Sprintf("provider:%s", provider.Name))
     s.cache.Delete(ctx, fmt.Sprintf("providers:%s", provider.Type))
     
-    log.WithFields(logger.Fields{
+    log.WithFields(logger.WithFields{
         "provider_id": provider.ID,
         "name": provider.Name,
         "type": provider.Type,
@@ -177,8 +178,7 @@ func (s *Service) UpdateProvider(ctx context.Context, name string, updates map[s
     needsARAUpdate := false
     for key := range updates {
         if key == "host" || key == "port" || key == "username" || 
-           key == "password" || key == "auth
-_type" || key == "codecs" {
+           key == "password" || key == "auth_type" || key == "codecs" {
            needsARAUpdate = true
            break
        }

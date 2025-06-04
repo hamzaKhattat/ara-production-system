@@ -14,7 +14,7 @@ import (
 //go:embed migrations/*.sql
 var migrationsFS embed.FS
 
-func RunMigrations(db *sql.DB) error {
+func RunDatabaseMigrations(db *sql.DB) error {
     driver, err := mysql.WithInstance(db, &mysql.Config{})
     if err != nil {
         return fmt.Errorf("failed to create migration driver: %w", err)
