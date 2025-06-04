@@ -1,0 +1,109 @@
+version: '3.8'
+
+services:
+ mysql:
+   image: mysql:8.0
+   environment:
+     MYSQL_ROOT_PASSWORD: root_password
+     MYSQL_DATABASE: asterisk_ara
+     MYSQL_USER: asterisk
+     MYSQL_PASSWORD: asterisk_secure_pass
+   ports:
+     - "3306:3306"
+   volumes:
+     - mysql_data:/var/lib/mysql
+   healthcheck:
+     test: ["CMD", "mysqladmin", "ping", "-h", "localhost"]
+     timeout: 20s
+     retries: 10
+
+ redis:
+   image: redis:7-alpine
+   ports:
+     - "6379:6379"
+   command: redis-server --appendonly yes
+   volumes:
+     - redis_data:/data
+   healthcheck:
+     test: ["CMD", "redis-cli", "ping"]
+     interval: 5s
+     timeout: 3s
+     retries: 5
+
+ asterisk:
+   image: asterisk:18-alpine
+   depends_on:
+     - mysql
+   environment:
+     ASTERISK_DB_HOST: mysql
+     ASTERISK_DB_USER: asterisk
+     ASTERISK_DB_PASSWORD: asterisk_secure_pass
+     ASTERISK_DB_NAME: asterisk_ara
+   ports:
+     - "5060:5060/udp"
+     - "5060:5060/tcp"
+     - "10000-10100:10000-10100/udp"
+   volumes:
+     - asterisk_config:/etc/asterisk
+     - asterisk_sounds:/var/lib/asterisk/sounds
+     - asterisk_monitor:/var/spool/asterisk/monitor
+
+ ara-router:
+   build: .
+   depends_on:
+     - mysql
+     - redis
+     - asterisk
+   environment:
+     DB_HOST: mysql
+     DB_USER: asterisk
+     DB_PASS: asterisk_secure_pass
+     REDIS_HOST: redis
+     AMI_HOST: asterisk
+     AMI_USER: admin
+     AMI_PASS: admin_secure_pass
+   ports:
+     - "4573:4573"   # AGI
+     - "8080:8080"   # Health
+     - "8081:8081"   # API
+     - "9090:9090"   # Metrics
+   volumes:
+     - ./configs:/app/configs
+     - router_logs:/var/log/asterisk-router
+     - asterisk_monitor:/var/spool/asterisk/monitor
+   command: ["-config", "/app/configs/production.yaml", "-agi", "-verbose"]
+
+ prometheus:
+   image: prom/prometheus:latest
+   ports:
+     - "9091:9090"
+   volumes:
+     - ./prometheus.yml:/etc/prometheus/prometheus.yml
+     - prometheus_data:/prometheus
+   command:
+     - '--config.file=/etc/prometheus/prometheus.yml'
+     - '--storage.tsdb.path=/prometheus'
+
+ grafana:
+   image: grafana/grafana:latest
+   depends_on:
+     - prometheus
+   ports:
+     - "3000:3000"
+   volumes:
+     - grafana_data:/var/lib/grafana
+     - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+     - ./grafana/datasources:/etc/grafana/provisioning/datasources
+   environment:
+     - GF_SECURITY_ADMIN_PASSWORD=admin
+     - GF_USERS_ALLOW_SIGN_UP=false
+
+volumes:
+ mysql_data:
+ redis_data:
+ asterisk_config:
+ asterisk_sounds:
+ asterisk_monitor:
+ router_logs:
+ prometheus_data:
+ grafana_data:
