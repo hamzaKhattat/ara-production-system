@@ -8,7 +8,7 @@ import (
    "os"
    "strings"
    "time"
-   
+   "database/sql"
    "github.com/fatih/color"
    "github.com/olekukonko/tablewriter"
    "github.com/spf13/cobra"
@@ -127,8 +127,7 @@ func createProviderListCommand() *cobra.Command {
                filter["type"] = providerType
            }
            
-           providers, err
-:= providerSvc.ListProviders(ctx, filter)
+           providers, err:= providerSvc.ListProviders(ctx, filter)
            if err != nil {
                return fmt.Errorf("failed to list providers: %v", err)
            }
@@ -173,7 +172,7 @@ func createProviderListCommand() *cobra.Command {
            table.Render()
            return nil
        },
-   }
+   } 
    
    cmd.Flags().StringVarP(&providerType, "type", "t", "", "Filter by provider type")
    
