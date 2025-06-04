@@ -117,7 +117,7 @@ func WithContext(ctx context.Context) *Logger {
     return defaultLogger.WithFields(fields)
 }
 
-func (l *Logger) WithFields(fields logrus.Fields) *Logger {
+func (l *Logger) WithFields(fields map[string]interface{}) *Logger {
     newFields := make(logrus.Fields)
     for k, v := range l.fields {
         newFields[k] = v
@@ -126,40 +126,86 @@ func (l *Logger) WithFields(fields logrus.Fields) *Logger {
         newFields[k] = v
     }
     
+    entry := l.Logger.WithFields(newFields)
     return &Logger{
-        Logger: l.Logger,
+        Logger: entry.Logger,
         fields: newFields,
     }
 }
 
+func (l *Logger) WithField(key string, value interface{}) *Logger {
+    return l.WithFields(map[string]interface{}{key: value})
+}
+
 func (l *Logger) WithError(err error) *Logger {
-    return l.WithFields(logrus.Fields{
-        "error": err.Error(),
+    return l.WithFields(map[string]interface{}{
+        "error":      err.Error(),
         "error_type": fmt.Sprintf("%T", err),
     })
 }
 
+// Log methods that use the logger fields
+func (l *Logger) Debug(args ...interface{}) {
+    l.Logger.WithFields(l.fields).Debug(args...)
+}
+
+func (l *Logger) Info(args ...interface{}) {
+    l.Logger.WithFields(l.fields).Info(args...)
+}
+
+func (l *Logger) Warn(args ...interface{}) {
+    l.Logger.WithFields(l.fields).Warn(args...)
+}
+
+func (l *Logger) Error(args ...interface{}) {
+    l.Logger.WithFields(l.fields).Error(args...)
+}
+
+func (l *Logger) Fatal(args ...interface{}) {
+    l.Logger.WithFields(l.fields).Fatal(args...)
+}
+
 // Convenience functions
 func Debug(args ...interface{}) {
-    defaultLogger.WithFields(defaultLogger.fields).Debug(args...)
+    if defaultLogger != nil {
+        defaultLogger.WithFields(defaultLogger.fields).Debug(args...)
+    }
 }
 
 func Info(args ...interface{}) {
-    defaultLogger.WithFields(defaultLogger.fields).Info(args...)
+    if defaultLogger != nil {
+        defaultLogger.WithFields(defaultLogger.fields).Info(args...)
+    }
 }
 
 func Warn(args ...interface{}) {
-    defaultLogger.WithFields(defaultLogger.fields).Warn(args...)
+    if defaultLogger != nil {
+        defaultLogger.WithFields(defaultLogger.fields).Warn(args...)
+    }
 }
 
 func Error(args ...interface{}) {
-    defaultLogger.WithFields(defaultLogger.fields).Error(args...)
+    if defaultLogger != nil {
+        defaultLogger.WithFields(defaultLogger.fields).Error(args...)
+    }
 }
 
 func Fatal(args ...interface{}) {
-    defaultLogger.WithFields(defaultLogger.fields).Fatal(args...)
+    if defaultLogger != nil {
+        defaultLogger.WithFields(defaultLogger.fields).Fatal(args...)
+    }
 }
 
 func WithField(key string, value interface{}) *Logger {
-    return defaultLogger.WithFields(logrus.Fields{key: value})
+    if defaultLogger != nil {
+        return defaultLogger.WithField(key, value)
+    }
+    return &Logger{Logger: logrus.New(), fields: make(logrus.Fields)}
+}
+
+func WithError(err error) *Logger {
+    if defaultLogger != nil {
+        return defaultLogger.WithError(err)
+    }
+    return &Logger{Logger: logrus.New(), fields: make(logrus.Fields)}
 }

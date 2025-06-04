@@ -4,6 +4,7 @@ import (
     "context"
     "database/sql"
     "fmt"
+    "strings"
     "sync"
     "time"
     
@@ -71,7 +72,7 @@ func newDB(cfg Config) (*DB, error) {
         }
         
         if i < cfg.RetryAttempts {
-            logger.WithField("attempt", i+1).WithError(err).Warn("Database connection failed, retrying...")
+            logger.WithField("attempt", i+1).WithField("error", err.Error()).Warn("Database connection failed, retrying...")
             time.Sleep(cfg.RetryDelay * time.Duration(i+1))
         }
     }
@@ -116,7 +117,7 @@ func (db *DB) healthCheck() {
             if db.health {
                 logger.Info("Database connection recovered")
             } else {
-                logger.WithError(err).Error("Database connection lost")
+                logger.WithField("error", err.Error()).Error("Database connection lost")
             }
         }
     }
@@ -146,7 +147,7 @@ func (db *DB) Transaction(ctx context.Context, fn func(*sql.Tx) error) error {
             case <-ctx.Done():
                 return ctx.Err()
             case <-time.After(db.cfg.RetryDelay * time.Duration(i+1)):
-                logger.WithField("attempt", i+1).WithError(err).Warn("Transaction failed, retrying...")
+                logger.WithField("attempt", i+1).WithField("error", err.Error()).Warn("Transaction failed, retrying...")
             }
         }
     }
@@ -250,3 +251,22 @@ func (c *StmtCache) Close() {
     
     c.stmts = make(map[string]*sql.Stmt)
 }
+
+// RunMigrations runs database migrations
+func RunMigrations(db *sql.DB) error {
+    // This is a placeholder - in production you'd use golang-migrate
+    // For now, just check if tables exist
+    query := `SHOW TABLES LIKE 'providers'`
+    var tableName string
+    err := db.QueryRow(query).Scan(&tableName)
+    
+    if err == sql.ErrNoRows {
+        // Tables don't exist, run initial schema
+        logger.Info("Running initial database migration")
+        // You would execute your migration SQL here
+        return fmt.Errorf("please run the initial schema SQL manually")
+    }
+    
+    return nil
+}
+

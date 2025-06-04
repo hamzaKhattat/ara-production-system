@@ -3,7 +3,9 @@ package router
 import (
     "context"
     "database/sql"
+    "encoding/json"  // Added missing import
     "fmt"
+    "strings"       // Added missing import
     "sync"
     "time"
     
@@ -12,6 +14,7 @@ import (
     "github.com/hamzaKhattat/ara-production-system/pkg/errors"
 )
 
+// Router handles call routing logic
 type Router struct {
     db           *sql.DB
     cache        CacheInterface
@@ -25,6 +28,7 @@ type Router struct {
     config Config
 }
 
+// Config holds router configuration
 type Config struct {
     DIDAllocationTimeout time.Duration
     CallCleanupInterval  time.Duration
@@ -34,6 +38,7 @@ type Config struct {
     StrictMode           bool
 }
 
+// CacheInterface defines cache operations
 type CacheInterface interface {
     Get(ctx context.Context, key string, dest interface{}) error
     Set(ctx context.Context, key string, value interface{}, expiration time.Duration) error
@@ -41,12 +46,14 @@ type CacheInterface interface {
     Lock(ctx context.Context, key string, ttl time.Duration) (func(), error)
 }
 
+// MetricsInterface defines metrics operations
 type MetricsInterface interface {
     IncrementCounter(name string, labels map[string]string)
     ObserveHistogram(name string, value float64, labels map[string]string)
     SetGauge(name string, value float64, labels map[string]string)
 }
 
+// NewRouter creates a new router instance
 func NewRouter(db *sql.DB, cache CacheInterface, metrics MetricsInterface, config Config) *Router {
     r := &Router{
         db:           db,
@@ -66,7 +73,7 @@ func NewRouter(db *sql.DB, cache CacheInterface, metrics MetricsInterface, confi
 
 // ProcessIncomingCall handles call from S1 to S2 (Step 1 in UML)
 func (r *Router) ProcessIncomingCall(ctx context.Context, callID, ani, dnis, inboundProvider string) (*models.CallResponse, error) {
-    log := logger.WithContext(ctx).WithFields(logger.Fields{
+    log := logger.WithContext(ctx).WithFields(map[string]interface{}{
         "call_id": callID,
         "ani": ani,
         "dnis": dnis,
@@ -185,7 +192,7 @@ func (r *Router) ProcessIncomingCall(ctx context.Context, callID, ani, dnis, inb
         DNISToSend:  did,   // DID
     }
     
-    log.WithFields(logger.Fields{
+    log.WithFields(map[string]interface{}{
         "did_assigned": did,
         "next_hop": response.NextHop,
         "intermediate": intermediateProvider.Name,
@@ -197,7 +204,7 @@ func (r *Router) ProcessIncomingCall(ctx context.Context, callID, ani, dnis, inb
 
 // ProcessReturnCall handles call returning from S3 (Step 3 in UML)
 func (r *Router) ProcessReturnCall(ctx context.Context, ani2, did, provider, sourceIP string) (*models.CallResponse, error) {
-    log := logger.WithContext(ctx).WithFields(logger.Fields{
+    log := logger.WithContext(ctx).WithFields(map[string]interface{}{
         "ani2": ani2,
         "did": did,
         "provider": provider,
@@ -252,126 +259,125 @@ func (r *Router) ProcessReturnCall(ctx context.Context, ani2, did, provider, sou
     // Build response for routing to S4
     response := &models.CallResponse{
         Status:     "success",
-        NextHop:    fmt.Sprintf("endpoint-%s", record.FinalProvider),
-        ANIToSend:  record.OriginalANI,   // Restore ANI-1
-        DNISToSend: record.OriginalDNIS,  // Restore DNIS-1
-    }
-    
-    log.WithFields(logger.Fields{
-        "call_id": callID,
-        "next_hop": response.NextHop,
-        "final_provider": record.FinalProvider,
-    }).Info("Return call processed successfully")
-    
-    return response, nil
+NextHop:    fmt.Sprintf("endpoint-%s", record.FinalProvider),
+       ANIToSend:  record.OriginalANI,   // Restore ANI-1
+       DNISToSend: record.OriginalDNIS,  // Restore DNIS-1
+   }
+   
+   log.WithFields(map[string]interface{}{
+       "call_id": callID,
+       "next_hop": response.NextHop,
+       "final_provider": record.FinalProvider,
+   }).Info("Return call processed successfully")
+   
+   return response, nil
 }
 
 // ProcessFinalCall handles the final call from S4 (Step 5 in UML)
 func (r *Router) ProcessFinalCall(ctx context.Context, callID, ani, dnis, provider, sourceIP string) error {
-    log := logger.WithContext(ctx).WithFields(logger.Fields{
-        "call_id": callID,
-        "ani": ani,
-        "dnis": dnis,
-        "provider": provider,
-        "source_ip": sourceIP,
-    })
-    
-    log.Info("Processing final call from S4")
-    
-    // Find call record
-    r.mu.RLock()
-    record, exists := r.activeCalls[callID]
-    r.mu.RUnlock()
-    
-    if !exists {
-        // Try to find by ANI/DNIS combination
-        r.mu.RLock()
-        for cid, rec := range r.activeCalls {
-            if rec.OriginalANI == ani && rec.OriginalDNIS == dnis {
-                record = rec
-                callID = cid
-                break
-            }
-        }
-        r.mu.RUnlock()
-        
-        if record == nil {
-            return errors.New(errors.ErrCallNotFound, "call not found").
-                WithContext("call_id", callID).
-                WithContext("ani", ani).
-                WithContext("dnis", dnis)
-        }
-    }
-    
-    // Verify if enabled
-    if r.config.VerificationEnabled {
-        if err := r.verifyFinalCall(ctx, record, ani, dnis, provider, sourceIP); err != nil {
-            r.metrics.IncrementCounter("router_verification_failed", map[string]string{
-                "stage": "final",
-                "reason": "verification_failed",
-            })
-            
-            if r.config.StrictMode {
-                return err
-            }
-            log.WithError(err).Warn("Verification failed but continuing")
-        }
-    }
-    
-    // Calculate duration
-    duration := time.Since(record.StartTime)
-    
-    // Start transaction for cleanup
-    tx, err := r.db.BeginTx(ctx, nil)
-    if err != nil {
-        return errors.Wrap(err, errors.ErrDatabase, "failed to start transaction")
-    }
-    defer tx.Rollback()
-    
-    // Update call record
-    now := time.Now()
-    record.Status = models.CallStatusCompleted
-    record.CurrentStep = "COMPLETED"
-    record.EndTime = &now
-    record.Duration = int(duration.Seconds())
-    record.BillableDuration = record.Duration // Can be adjusted based on billing rules
-    
-    if err := r.updateCallRecord(ctx, tx, record); err != nil {
-        log.WithError(err).Error("Failed to update call record")
-    }
-    
-    // Release DID
-    if err := r.releaseDID(ctx, tx, record.AssignedDID); err != nil {
-        log.WithError(err).Error("Failed to release DID")
-    }
-    
-    // Update route current calls
-    if _, err := tx.ExecContext(ctx,
-        "UPDATE provider_routes SET current_calls = GREATEST(current_calls - 1, 0) WHERE name = ?",
-        record.RouteName); err != nil {
-        log.WithError(err).Warn("Failed to update route call count")
-    }
-    
-    // Commit transaction
-    if err := tx.Commit(); err != nil {
-        return errors.Wrap(err, errors.ErrDatabase, "failed to commit transaction")
-    }
-    
-    // Update load balancer stats
-    r.loadBalancer.UpdateCallComplete(record.IntermediateProvider, true, duration)
-    r.loadBalancer.UpdateCallComplete(record.FinalProvider, true, duration)
-    r.loadBalancer.DecrementActiveCalls(record.IntermediateProvider)
-    r.loadBalancer.DecrementActiveCalls(record.FinalProvider)
-    
-    // Clean up memory
-    r.mu.Lock()
-    delete(r.activeCalls, callID)
-    delete(r.didToCall, record.AssignedDID)
-    r.mu.Unlock()
-    
-    // Update metrics
-    r.metrics.Increment()
-Counter("router_calls_completed", map[string]string{
+   log := logger.WithContext(ctx).WithFields(map[string]interface{}{
+       "call_id": callID,
+       "ani": ani,
+       "dnis": dnis,
+       "provider": provider,
+       "source_ip": sourceIP,
+   })
+   
+   log.Info("Processing final call from S4")
+   
+   // Find call record
+   r.mu.RLock()
+   record, exists := r.activeCalls[callID]
+   r.mu.RUnlock()
+   
+   if !exists {
+       // Try to find by ANI/DNIS combination
+       r.mu.RLock()
+       for cid, rec := range r.activeCalls {
+           if rec.OriginalANI == ani && rec.OriginalDNIS == dnis {
+               record = rec
+               callID = cid
+               break
+           }
+       }
+       r.mu.RUnlock()
+       
+       if record == nil {
+           return errors.New(errors.ErrCallNotFound, "call not found").
+               WithContext("call_id", callID).
+               WithContext("ani", ani).
+               WithContext("dnis", dnis)
+       }
+   }
+   
+   // Verify if enabled
+   if r.config.VerificationEnabled {
+       if err := r.verifyFinalCall(ctx, record, ani, dnis, provider, sourceIP); err != nil {
+           r.metrics.IncrementCounter("router_verification_failed", map[string]string{
+               "stage": "final",
+               "reason": "verification_failed",
+           })
+           
+           if r.config.StrictMode {
+               return err
+           }
+           log.WithError(err).Warn("Verification failed but continuing")
+       }
+   }
+   
+   // Calculate duration
+   duration := time.Since(record.StartTime)
+   
+   // Start transaction for cleanup
+   tx, err := r.db.BeginTx(ctx, nil)
+   if err != nil {
+       return errors.Wrap(err, errors.ErrDatabase, "failed to start transaction")
+   }
+   defer tx.Rollback()
+   
+   // Update call record
+   now := time.Now()
+   record.Status = models.CallStatusCompleted
+   record.CurrentStep = "COMPLETED"
+   record.EndTime = &now
+   record.Duration = int(duration.Seconds())
+   record.BillableDuration = record.Duration // Can be adjusted based on billing rules
+   
+   if err := r.updateCallRecord(ctx, tx, record); err != nil {
+       log.WithError(err).Error("Failed to update call record")
+   }
+   
+   // Release DID
+   if err := r.releaseDID(ctx, tx, record.AssignedDID); err != nil {
+       log.WithError(err).Error("Failed to release DID")
+   }
+   
+   // Update route current calls
+   if _, err := tx.ExecContext(ctx,
+       "UPDATE provider_routes SET current_calls = GREATEST(current_calls - 1, 0) WHERE name = ?",
+       record.RouteName); err != nil {
+       log.WithError(err).Warn("Failed to update route call count")
+   }
+   
+   // Commit transaction
+   if err := tx.Commit(); err != nil {
+       return errors.Wrap(err, errors.ErrDatabase, "failed to commit transaction")
+   }
+   
+   // Update load balancer stats
+   r.loadBalancer.UpdateCallComplete(record.IntermediateProvider, true, duration)
+   r.loadBalancer.UpdateCallComplete(record.FinalProvider, true, duration)
+   r.loadBalancer.DecrementActiveCalls(record.IntermediateProvider)
+   r.loadBalancer.DecrementActiveCalls(record.FinalProvider)
+   
+   // Clean up memory
+   r.mu.Lock()
+   delete(r.activeCalls, callID)
+   delete(r.didToCall, record.AssignedDID)
+   r.mu.Unlock()
+   
+   // Update metrics
+   r.metrics.IncrementCounter("router_calls_completed", map[string]string{
        "route": record.RouteName,
        "intermediate": record.IntermediateProvider,
        "final": record.FinalProvider,
@@ -381,7 +387,7 @@ Counter("router_calls_completed", map[string]string{
    })
    r.metrics.SetGauge("router_active_calls", float64(len(r.activeCalls)), nil)
    
-   log.WithFields(logger.Fields{
+   log.WithFields(map[string]interface{}{
        "duration": duration.Seconds(),
        "billable": record.BillableDuration,
    }).Info("Call completed successfully")
@@ -447,6 +453,11 @@ func (r *Router) ProcessHangup(ctx context.Context, callID string) error {
    }
    
    return nil
+}
+
+// GetLoadBalancer returns the load balancer instance
+func (r *Router) GetLoadBalancer() *LoadBalancer {
+   return r.loadBalancer
 }
 
 // Helper methods

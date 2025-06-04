@@ -81,12 +81,12 @@ func (c *Cache) Get(ctx context.Context, key string, dest interface{}) error {
         return nil // Cache miss
     }
     if err != nil {
-        logger.WithError(err).WithField("key", key).Warn("Cache get failed")
+        logger.WithContext(ctx).WithField("key", key).WithField("error", err.Error()).Warn("Cache get failed")
         return nil // Don't fail on cache errors
     }
     
     if err := json.Unmarshal([]byte(val), dest); err != nil {
-        logger.WithError(err).WithField("key", key).Warn("Cache unmarshal failed")
+        logger.WithContext(ctx).WithField("key", key).WithField("error", err.Error()).Warn("Cache unmarshal failed")
         return nil
     }
     
@@ -104,7 +104,7 @@ func (c *Cache) Set(ctx context.Context, key string, value interface{}, expirati
     }
     
     if err := c.client.Set(ctx, c.key(key), data, expiration).Err(); err != nil {
-        logger.WithError(err).WithField("key", key).Warn("Cache set failed")
+        logger.WithContext(ctx).WithField("key", key).WithField("error", err.Error()).Warn("Cache set failed")
     }
     
     return nil
@@ -121,34 +121,10 @@ func (c *Cache) Delete(ctx context.Context, keys ...string) error {
     }
     
     if err := c.client.Del(ctx, fullKeys...).Err(); err != nil {
-        logger.WithError(err).Warn("Cache delete failed")
+        logger.WithContext(ctx).WithField("error", err.Error()).Warn("Cache delete failed")
     }
     
     return nil
-}
-
-func (c *Cache) Invalidate(ctx context.Context, pattern string) error {
-    if c.client == nil {
-        return nil
-    }
-    
-    iter := c.client.Scan(ctx, 0, c.key(pattern), 0).Iterator()
-    var keys []string
-    
-    for iter.Next(ctx) {
-        keys = append(keys, iter.Val())
-        
-        if len(keys) >= 1000 {
-            c.client.Del(ctx, keys...)
-            keys = keys[:0]
-        }
-    }
-    
-    if len(keys) > 0 {
-        c.client.Del(ctx, keys...)
-    }
-    
-    return iter.Err()
 }
 
 // Distributed lock

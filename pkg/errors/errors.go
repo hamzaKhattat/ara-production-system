@@ -132,4 +132,18 @@ func Is(err error, code ErrorCode) bool {
     }
     
     return appErr.Code == code
+} 
+// Add this function at the end of the file
+
+// GetCode extracts the error code from an error
+func GetCode(err error) string {
+    if err == nil {
+        return ""
+    }
+    
+    if appErr, ok := err.(*AppError); ok {
+        return string(appErr.Code)
+    }
+    
+    return "UNKNOWN_ERROR"
 }

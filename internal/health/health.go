@@ -3,6 +3,7 @@ package health
 import (
     "context"
     "encoding/json"
+    "fmt"
     "net/http"
     "sync"
     "time"
@@ -43,116 +44,116 @@ type CheckResult struct {
 
 func NewHealthService(port int) *HealthService {
     hs := &HealthService{
-        checks:      make(map[string]Checker),
-        readyChecks: make(map[string]Checker),
-    }
-    
-    router := mux.NewRouter()
-    router.HandleFunc("/health/live", hs.handleLiveness).Methods("GET")
-    router.HandleFunc("/health/ready", hs.handleReadiness).Methods("GET")
-    
-    hs.server = &http.Server{
-        Addr:         fmt.Sprintf(":%d", port),
-        Handler:      router,
-        ReadTimeout:  10 * time.Second,
-        WriteTimeout: 10 * time.Second,
-    }
-    
-    return hs
+checks:      make(map[string]Checker),
+       readyChecks: make(map[string]Checker),
+   }
+   
+   router := mux.NewRouter()
+   router.HandleFunc("/health/live", hs.handleLiveness).Methods("GET")
+   router.HandleFunc("/health/ready", hs.handleReadiness).Methods("GET")
+   
+   hs.server = &http.Server{
+       Addr:         fmt.Sprintf(":%d", port),
+       Handler:      router,
+       ReadTimeout:  10 * time.Second,
+       WriteTimeout: 10 * time.Second,
+   }
+   
+   return hs
 }
 
 func (hs *HealthService) Start() error {
-    logger.WithField("addr", hs.server.Addr).Info("Health service started")
-    return hs.server.ListenAndServe()
+   logger.WithField("addr", hs.server.Addr).Info("Health service started")
+   return hs.server.ListenAndServe()
 }
 
 func (hs *HealthService) Stop() error {
-    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-    defer cancel()
-    return hs.server.Shutdown(ctx)
+   ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+   defer cancel()
+   return hs.server.Shutdown(ctx)
 }
 
 func (hs *HealthService) RegisterLivenessCheck(name string, check Checker) {
-    hs.mu.Lock()
-    defer hs.mu.Unlock()
-    hs.checks[name] = check
+   hs.mu.Lock()
+   defer hs.mu.Unlock()
+   hs.checks[name] = check
 }
 
 func (hs *HealthService) RegisterReadinessCheck(name string, check Checker) {
-    hs.mu.Lock()
-    defer hs.mu.Unlock()
-    hs.readyChecks[name] = check
+   hs.mu.Lock()
+   defer hs.mu.Unlock()
+   hs.readyChecks[name] = check
 }
 
 func (hs *HealthService) handleLiveness(w http.ResponseWriter, r *http.Request) {
-    hs.handleCheck(w, r, hs.checks)
+   hs.handleCheck(w, r, hs.checks)
 }
 
 func (hs *HealthService) handleReadiness(w http.ResponseWriter, r *http.Request) {
-    hs.handleCheck(w, r, hs.readyChecks)
+   hs.handleCheck(w, r, hs.readyChecks)
 }
 
 func (hs *HealthService) handleCheck(w http.ResponseWriter, r *http.Request, checks map[string]Checker) {
-    ctx := r.Context()
-    start := time.Now()
-    
-    hs.mu.RLock()
-    defer hs.mu.RUnlock()
-    
-    response := HealthResponse{
-        Status:    "ok",
-        Timestamp: start,
-        Checks:    make(map[string]CheckResult),
-    }
-    
-    var wg sync.WaitGroup
-    resultChan := make(chan struct {
-        name   string
-        result CheckResult
-    }, len(checks))
-    
-    for name, check := range checks {
-        wg.Add(1)
-        go func(n string, c Checker) {
-            defer wg.Done()
-            
-            checkStart := time.Now()
-            err := c.Check(ctx)
-            duration := time.Since(checkStart)
-            
-            result := CheckResult{
-                Status:   "ok",
-                Duration: duration.String(),
-            }
-            
-            if err != nil {
-                result.Status = "failed"
-                result.Error = err.Error()
-                response.Status = "failed"
-            }
-            
-            resultChan <- struct {
-                name   string
-                result CheckResult
-            }{n, result}
-        }(name, check)
-    }
-    
-    go func() {
-        wg.Wait()
-        close(resultChan)
-    }()
-    
-    for res := range resultChan {
-        response.Checks[res.name] = res.result
-    }
-    
-    response.TotalTime = time.Since(start).String()
-    
-    w.Header().Set("Content-Type", "application/json")
-    if response.Status != "ok" {
-        w.WriteHeader(http.StatusServiceUnavailable)
-    }
-    
-    json.NewEncoder(w).Encode(response)
+   ctx := r.Context()
+   start := time.Now()
+   
+   hs.mu.RLock()
+   defer hs.mu.RUnlock()
+   
+   response := HealthResponse{
+       Status:    "ok",
+       Timestamp: start,
+       Checks:    make(map[string]CheckResult),
+   }
+   
+   var wg sync.WaitGroup
+   resultChan := make(chan struct {
+       name   string
+       result CheckResult
+   }, len(checks))
+   
+   for name, check := range checks {
+       wg.Add(1)
+       go func(n string, c Checker) {
+           defer wg.Done()
+           
+           checkStart := time.Now()
+           err := c.Check(ctx)
+           duration := time.Since(checkStart)
+           
+           result := CheckResult{
+               Status:   "ok",
+               Duration: duration.String(),
+           }
+           
+           if err != nil {
+               result.Status = "failed"
+               result.Error = err.Error()
+               response.Status = "failed"
+           }
+           
+           resultChan <- struct {
+               name   string
+               result CheckResult
+           }{n, result}
+       }(name, check)
+   }
+   
+   go func() {
+       wg.Wait()
+       close(resultChan)
+   }()
+   
+   for res := range resultChan {
+       response.Checks[res.name] = res.result
+   }
+   
+   response.TotalTime = time.Since(start).String()
+   
+   w.Header().Set("Content-Type", "application/json")
+   if response.Status != "ok" {
+       w.WriteHeader(http.StatusServiceUnavailable)
+   }
+   
+   json.NewEncoder(w).Encode(response)
 }
