@@ -138,6 +138,7 @@ func runCLI() {
    // Add commands
    rootCmd.AddCommand(
        createProviderCommands(),
+       createGroupCommands(), 
        createDIDCommands(),
        createRouteCommands(),
        createStatsCommand(),

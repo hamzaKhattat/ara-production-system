@@ -9,10 +9,14 @@ import (
    "strings"
    "time"
    "database/sql"
+   "github.com/spf13/viper"
+
    "github.com/fatih/color"
    "github.com/olekukonko/tablewriter"
    "github.com/spf13/cobra"
    "github.com/hamzaKhattat/ara-production-system/internal/models"
+   "github.com/hamzaKhattat/ara-production-system/pkg/logger"
+   "github.com/hamzaKhattat/ara-production-system/internal/provider"
 )
 
 var (
@@ -542,58 +546,99 @@ func createRouteCommands() *cobra.Command {
    
    return routeCmd
 }
-
+// Update createRouteAddCommand
 func createRouteAddCommand() *cobra.Command {
-   var (
-       mode        string
-       priority    int
-       weight      int
-       maxCalls    int
-       description string
-   )
-   
-   cmd := &cobra.Command{
-       Use:   "add <name> <inbound> <intermediate> <final>",
-       Short: "Add a new route",
-       Args:  cobra.ExactArgs(4),
-       RunE: func(cmd *cobra.Command, args []string) error {
-           ctx := context.Background()
-           
-           if err := initializeForCLI(ctx); err != nil {
-               return err
-           }
-           
-           route := &models.ProviderRoute{
-               Name:                 args[0],
-               InboundProvider:      args[1],
-               IntermediateProvider: args[2],
-               FinalProvider:        args[3],
-               Description:          description,
-               LoadBalanceMode:      models.LoadBalanceMode(mode),
-               Priority:             priority,
-               Weight:               weight,
-               MaxConcurrentCalls:   maxCalls,
-               Enabled:              true,
-           }
-           
-           if err := createRoute(ctx, route); err != nil {
-               return fmt.Errorf("failed to create route: %v", err)
-           }
-           
-           fmt.Printf("%s Route '%s' created successfully\n", green("✓"), args[0])
-           return nil
-       },
-   }
-   
-   cmd.Flags().StringVar(&mode, "mode", "round_robin", "Load balance mode")
-   cmd.Flags().IntVar(&priority, "priority", 10, "Route priority")
-   cmd.Flags().IntVar(&weight, "weight", 1, "Route weight")
-   cmd.Flags().IntVar(&maxCalls, "max-calls", 0, "Maximum concurrent calls")
-   cmd.Flags().StringVarP(&description, "description", "d", "", "Route description")
-   
-   return cmd
+    var (
+        mode        string
+        priority    int
+        weight      int
+        maxCalls    int
+        description string
+        useGroups   bool
+    )
+    
+    cmd := &cobra.Command{
+        Use:   "add <name> <inbound> <intermediate> <final>",
+        Short: "Add a new route",
+        Long:  "Add a new route. You can use provider names or group names (with --groups flag)",
+        Example: `  # Route with individual providers
+  router route add main s1 s3-provider1 s4-termination1
+  
+  # Route with groups
+  router route add morocco-route inbound morocco-group panama-group --groups
+  
+  # Mixed providers and groups
+  router route add mixed s1 intermediate-group s4-term1 --groups`,
+        Args:  cobra.ExactArgs(4),
+        RunE: func(cmd *cobra.Command, args []string) error {
+            ctx := context.Background()
+            
+            if err := initializeForCLI(ctx); err != nil {
+                return err
+            }
+            
+            route := &models.ProviderRoute{
+                Name:                 args[0],
+                InboundProvider:      args[1],
+                IntermediateProvider: args[2],
+                FinalProvider:        args[3],
+                Description:          description,
+                LoadBalanceMode:      models.LoadBalanceMode(mode),
+                Priority:             priority,
+                Weight:               weight,
+                MaxConcurrentCalls:   maxCalls,
+                Enabled:              true,
+            }
+            
+            // Check if using groups
+            if useGroups {
+                groupService := provider.NewGroupService(database.DB, cache)
+                
+                // Check each provider/group
+                if _, err := groupService.GetGroup(ctx, args[1]); err == nil {
+                    route.InboundIsGroup = true
+                }
+                if _, err := groupService.GetGroup(ctx, args[2]); err == nil {
+                    route.IntermediateIsGroup = true
+                }
+                if _, err := groupService.GetGroup(ctx, args[3]); err == nil {
+                    route.FinalIsGroup = true
+                }
+            }
+            
+            if err := createRoute(ctx, route); err != nil {
+                return fmt.Errorf("failed to create route: %v", err)
+            }
+            
+            fmt.Printf("%s Route '%s' created successfully\n", green("✓"), args[0])
+            
+            // Show route details
+            fmt.Printf("\nRoute Configuration:\n")
+            fmt.Printf("  Inbound:      %s %s\n", args[1], formatGroupIndicator(route.InboundIsGroup))
+            fmt.Printf("  Intermediate: %s %s\n", args[2], formatGroupIndicator(route.IntermediateIsGroup))
+            fmt.Printf("  Final:        %s %s\n", args[3], formatGroupIndicator(route.FinalIsGroup))
+            fmt.Printf("  Load Balance: %s\n", mode)
+            
+            return nil
+        },
+    }
+    
+    cmd.Flags().StringVar(&mode, "mode", "round_robin", "Load balance mode")
+    cmd.Flags().IntVar(&priority, "priority", 10, "Route priority")
+    cmd.Flags().IntVar(&weight, "weight", 1, "Route weight")
+    cmd.Flags().IntVar(&maxCalls, "max-calls", 0, "Maximum concurrent calls")
+    cmd.Flags().StringVarP(&description, "description", "d", "", "Route description")
+    cmd.Flags().BoolVar(&useGroups, "groups", false, "Enable group support for this route")
+    
+    return cmd
 }
 
+func formatGroupIndicator(isGroup bool) string {
+    if isGroup {
+        return blue("[GROUP]")
+    }
+    return ""
+}
 func createRouteListCommand() *cobra.Command {
    return &cobra.Command{
        Use:   "list",
@@ -989,19 +1034,45 @@ cmd.Context().Done():
 }
 
 // Helper functions
-
+// Update the initializeForCLI function in cmd/router/commands.go
 func initializeForCLI(ctx context.Context) error {
-   if err := loadConfig(); err != nil {
-       return fmt.Errorf("failed to load config: %v", err)
-   }
-   
-   if err := initializeDatabase(ctx); err != nil {
-       return fmt.Errorf("failed to initialize database: %v", err)
-   }
-   
-   return nil
+    if err := loadConfig(); err != nil {
+        return fmt.Errorf("failed to load config: %v", err)
+    }
+    
+    // Initialize logger - ADD THIS SECTION
+    logConfig := logger.Config{
+        Level:  viper.GetString("monitoring.logging.level"),
+        Format: viper.GetString("monitoring.logging.format"),
+        Output: viper.GetString("monitoring.logging.output"),
+        File: logger.FileConfig{
+            Enabled:    viper.GetBool("monitoring.logging.file.enabled"),
+            Path:       viper.GetString("monitoring.logging.file.path"),
+            MaxSize:    viper.GetInt("monitoring.logging.file.max_size"),
+            MaxBackups: viper.GetInt("monitoring.logging.file.max_backups"),
+            MaxAge:     viper.GetInt("monitoring.logging.file.max_age"),
+            Compress:   viper.GetBool("monitoring.logging.file.compress"),
+        },
+    }
+    
+    // Set defaults if not configured
+    if logConfig.Level == "" {
+        logConfig.Level = "info"
+    }
+    if logConfig.Format == "" {
+        logConfig.Format = "text"  // Use text format for CLI
+    }
+    
+    if err := logger.Init(logConfig); err != nil {
+        return fmt.Errorf("failed to initialize logger: %v", err)
+    }
+    
+    if err := initializeDatabase(ctx); err != nil {
+        return fmt.Errorf("failed to initialize database: %v", err)
+    }
+    
+    return nil
 }
-
 func formatStatus(active bool, healthStatus string) string {
    if !active {
        return red("Inactive")

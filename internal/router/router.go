@@ -12,6 +12,8 @@ import (
     "github.com/hamzaKhattat/ara-production-system/internal/models"
     "github.com/hamzaKhattat/ara-production-system/pkg/logger"
     "github.com/hamzaKhattat/ara-production-system/pkg/errors"
+    "github.com/hamzaKhattat/ara-production-system/internal/provider"
+
 )
 
 // Router handles call routing logic
@@ -71,7 +73,7 @@ func NewRouter(db *sql.DB, cache CacheInterface, metrics MetricsInterface, confi
     return r
 }
 
-// ProcessIncomingCall handles call from S1 to S2 (Step 1 in UML)
+// Update the ProcessIncomingCall method to use groups
 func (r *Router) ProcessIncomingCall(ctx context.Context, callID, ani, dnis, inboundProvider string) (*models.CallResponse, error) {
     log := logger.WithContext(ctx).WithFields(map[string]interface{}{
         "call_id": callID,
@@ -89,8 +91,8 @@ func (r *Router) ProcessIncomingCall(ctx context.Context, callID, ani, dnis, inb
     }
     defer tx.Rollback()
     
-    // Get route for this inbound provider
-    route, err := r.getRouteForInbound(ctx, tx, inboundProvider)
+    // Get route for this inbound provider (now supports groups)
+    route, err := r.getRouteForInboundWithGroups(ctx, tx, inboundProvider)
     if err != nil {
         r.metrics.IncrementCounter("router_calls_failed", map[string]string{
             "reason": "no_route",
@@ -101,8 +103,14 @@ func (r *Router) ProcessIncomingCall(ctx context.Context, callID, ani, dnis, inb
     
     log.WithField("route", route.Name).Debug("Found route for inbound provider")
     
-    // Select intermediate provider using load balancing
-    intermediateProvider, err := r.loadBalancer.SelectProvider(ctx, route.IntermediateProvider, route.LoadBalanceMode)
+    // Select intermediate provider (handle group or individual)
+    var intermediateProvider *models.Provider
+    if route.IntermediateIsGroup {
+        intermediateProvider, err = r.selectProviderFromGroup(ctx, route.IntermediateProvider, route.LoadBalanceMode)
+    } else {
+        intermediateProvider, err = r.loadBalancer.SelectProvider(ctx, route.IntermediateProvider, route.LoadBalanceMode)
+    }
+    
     if err != nil {
         r.metrics.IncrementCounter("router_calls_failed", map[string]string{
             "reason": "no_intermediate_provider",
@@ -111,8 +119,14 @@ func (r *Router) ProcessIncomingCall(ctx context.Context, callID, ani, dnis, inb
         return nil, err
     }
     
-    // Select final provider
-    finalProvider, err := r.loadBalancer.SelectProvider(ctx, route.FinalProvider, route.LoadBalanceMode)
+    // Select final provider (handle group or individual)
+    var finalProvider *models.Provider
+    if route.FinalIsGroup {
+        finalProvider, err = r.selectProviderFromGroup(ctx, route.FinalProvider, route.LoadBalanceMode)
+    } else {
+        finalProvider, err = r.loadBalancer.SelectProvider(ctx, route.FinalProvider, route.LoadBalanceMode)
+    }
+    
     if err != nil {
         r.metrics.IncrementCounter("router_calls_failed", map[string]string{
             "reason": "no_final_provider",
@@ -909,4 +923,81 @@ func (r *Router) GetActiveCall(ctx context.Context, callID string) (*models.Call
    }
    
    return record, nil
+}
+// Replace the getRouteForInboundWithGroups method in internal/router/router.go
+
+// getRouteForInboundWithGroups checks both direct provider matches and group membership
+func (r *Router) getRouteForInboundWithGroups(ctx context.Context, tx *sql.Tx, inboundProvider string) (*models.ProviderRoute, error) {
+    // Query for routes that match either directly or through group membership
+    query := `
+        SELECT pr.id, pr.name, pr.description, pr.inbound_provider, pr.intermediate_provider, 
+               pr.final_provider, pr.load_balance_mode, pr.priority, pr.weight,
+               pr.max_concurrent_calls, pr.current_calls, pr.enabled,
+               pr.failover_routes, pr.routing_rules, pr.metadata,
+               pr.inbound_is_group, pr.intermediate_is_group, pr.final_is_group
+        FROM provider_routes pr
+        WHERE pr.enabled = 1 AND (
+            (pr.inbound_provider = ? AND pr.inbound_is_group = 0) OR
+            (pr.inbound_is_group = 1 AND EXISTS (
+                SELECT 1 FROM provider_group_members pgm
+                JOIN provider_groups pg ON pgm.group_id = pg.id
+                WHERE pg.name = pr.inbound_provider AND pgm.provider_name = ?
+            ))
+        )
+        ORDER BY pr.priority DESC, pr.weight DESC
+        LIMIT 1`
+    
+    var route models.ProviderRoute
+    var inboundIsGroup, intermediateIsGroup, finalIsGroup sql.NullBool
+    
+    err := tx.QueryRowContext(ctx, query, inboundProvider, inboundProvider).Scan(
+        &route.ID, &route.Name, &route.Description,
+        &route.InboundProvider, &route.IntermediateProvider, &route.FinalProvider,
+        &route.LoadBalanceMode, &route.Priority, &route.Weight,
+        &route.MaxConcurrentCalls, &route.CurrentCalls, &route.Enabled,
+        &route.FailoverRoutes, &route.RoutingRules, &route.Metadata,
+        &inboundIsGroup, &intermediateIsGroup, &finalIsGroup,
+    )
+    
+    if err == sql.ErrNoRows {
+        return nil, errors.New(errors.ErrRouteNotFound, "no route for provider or group").
+            WithContext("provider", inboundProvider)
+    }
+    if err != nil {
+        return nil, errors.Wrap(err, errors.ErrDatabase, "failed to query route")
+    }
+    
+    // Set the boolean flags
+    route.InboundIsGroup = inboundIsGroup.Valid && inboundIsGroup.Bool
+    route.IntermediateIsGroup = intermediateIsGroup.Valid && intermediateIsGroup.Bool
+    route.FinalIsGroup = finalIsGroup.Valid && finalIsGroup.Bool
+    
+    // Check concurrent call limit
+    if route.MaxConcurrentCalls > 0 && route.CurrentCalls >= route.MaxConcurrentCalls {
+        return nil, errors.New(errors.ErrQuotaExceeded, "route at maximum capacity")
+    }
+    
+    // Cache for 1 minute
+    cacheKey := fmt.Sprintf("route:inbound:%s", inboundProvider)
+    r.cache.Set(ctx, cacheKey, route, time.Minute)
+    
+    return &route, nil
+}
+
+// Add method to select provider from group
+func (r *Router) selectProviderFromGroup(ctx context.Context, groupName string, mode models.LoadBalanceMode) (*models.Provider, error) {
+    // Get group members
+    groupService := provider.NewGroupService(r.db, r.cache)
+    members, err := groupService.GetGroupMembers(ctx, groupName)
+    if err != nil {
+        return nil, err
+    }
+    
+    if len(members) == 0 {
+        return nil, errors.New(errors.ErrProviderNotFound, "no providers in group")
+    }
+    
+    // Use existing load balancer logic to select from group members
+    // We'll need to add this method to LoadBalancer
+    return r.loadBalancer.SelectFromProviders(ctx, members, mode)
 }

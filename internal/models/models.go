@@ -111,7 +111,7 @@ type DID struct {
     UpdatedAt     time.Time  `json:"updated_at" db:"updated_at"`
 }
 
-// ProviderRoute defines routing rules
+// Update the ProviderRoute struct to include group support fields
 type ProviderRoute struct {
     ID                   int             `json:"id" db:"id"`
     Name                 string          `json:"name" db:"name"`
@@ -130,6 +130,11 @@ type ProviderRoute struct {
     Metadata             JSON            `json:"metadata,omitempty" db:"metadata"`
     CreatedAt            time.Time       `json:"created_at" db:"created_at"`
     UpdatedAt            time.Time       `json:"updated_at" db:"updated_at"`
+    
+    // Group support fields
+    InboundIsGroup      bool `json:"inbound_is_group" db:"inbound_is_group"`
+    IntermediateIsGroup bool `json:"intermediate_is_group" db:"intermediate_is_group"`
+    FinalIsGroup        bool `json:"final_is_group" db:"final_is_group"`
 }
 
 // CallRecord tracks call flow

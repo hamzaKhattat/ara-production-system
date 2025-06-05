@@ -604,3 +604,41 @@ func (lb *LoadBalancer) GetProviderStats() map[string]*models.ProviderStats {
     
     return stats
 }
+// Add this method to the LoadBalancer struct
+
+// SelectFromProviders selects a provider from a given list using the specified load balance mode
+func (lb *LoadBalancer) SelectFromProviders(ctx context.Context, providers []*models.Provider, mode models.LoadBalanceMode) (*models.Provider, error) {
+    if len(providers) == 0 {
+        return nil, errors.New(errors.ErrProviderNotFound, "no providers available")
+    }
+    
+    // Filter healthy providers
+    healthyProviders := lb.filterHealthyProviders(providers)
+    if len(healthyProviders) == 0 {
+        // If no healthy providers, try all providers
+        logger.WithContext(ctx).Warn("No healthy providers in list, using all available")
+        healthyProviders = providers
+    }
+    
+    // Select based on mode
+    switch mode {
+    case models.LoadBalanceModeRoundRobin:
+        // For groups, use the group name as the round-robin key
+        key := fmt.Sprintf("group:%v", time.Now().UnixNano()) // Unique key for this selection
+        return lb.selectRoundRobin(key, healthyProviders)
+    case models.LoadBalanceModeWeighted:
+        return lb.selectWeighted(healthyProviders)
+    case models.LoadBalanceModePriority:
+        return lb.selectPriority(healthyProviders)
+    case models.LoadBalanceModeFailover:
+        return lb.selectFailover(healthyProviders)
+    case models.LoadBalanceModeLeastConnections:
+        return lb.selectLeastConnections(healthyProviders)
+    case models.LoadBalanceModeResponseTime:
+        return lb.selectResponseTime(healthyProviders)
+    case models.LoadBalanceModeHash:
+        return lb.selectHash(ctx, healthyProviders)
+    default:
+        return lb.selectRoundRobin(fmt.Sprintf("default:%v", time.Now().UnixNano()), healthyProviders)
+    }
+}

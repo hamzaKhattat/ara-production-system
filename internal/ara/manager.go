@@ -31,7 +31,7 @@ func NewManager(db *sql.DB, cache CacheInterface) *Manager {
     }
 }
 
-// CreateEndpoint creates/updates PJSIP endpoint in ARA
+
 func (m *Manager) CreateEndpoint(ctx context.Context, provider *models.Provider) error {
     log := logger.WithContext(ctx)
     
@@ -121,11 +121,11 @@ func (m *Manager) CreateEndpoint(ctx context.Context, provider *models.Provider)
     // Create IP-based authentication if needed
     if provider.AuthType == "ip" || provider.AuthType == "both" {
         ipQuery := `
-            INSERT INTO ps_endpoint_id_ips (id, endpoint, match)
+            INSERT INTO ps_endpoint_id_ips (id, endpoint, ` + "`match`" + `)
             VALUES (?, ?, ?)
             ON DUPLICATE KEY UPDATE
                 endpoint = VALUES(endpoint),
-                match = VALUES(match)`
+                ` + "`match`" + ` = VALUES(` + "`match`" + `)`
         
         ipID := fmt.Sprintf("ip-%s", provider.Name)
         match := fmt.Sprintf("%s/32", provider.Host)
@@ -151,7 +151,6 @@ func (m *Manager) CreateEndpoint(ctx context.Context, provider *models.Provider)
     
     return nil
 }
-
 // DeleteEndpoint removes PJSIP endpoint from ARA
 func (m *Manager) DeleteEndpoint(ctx context.Context, providerName string) error {
     tx, err := m.db.BeginTx(ctx, nil)
@@ -347,8 +346,6 @@ func (m *Manager) insertExtensions(tx *sql.Tx, context string, extensions []Dial
     
     return nil
 }
-
-// GetEndpoint retrieves endpoint from cache or database
 func (m *Manager) GetEndpoint(ctx context.Context, name string) (*Endpoint, error) {
     cacheKey := fmt.Sprintf("endpoint:%s", name)
     
@@ -363,7 +360,7 @@ func (m *Manager) GetEndpoint(ctx context.Context, name string) (*Endpoint, erro
         SELECT e.id, e.transport, e.aors, e.auth, e.context, e.allow,
                e.direct_media, e.dtmf_mode, e.media_encryption,
                a.username, a.password,
-               i.match as ip_match
+               i.` + "`match`" + ` as ip_match
         FROM ps_endpoints e
         LEFT JOIN ps_auths a ON e.auth = a.id
         LEFT JOIN ps_endpoint_id_ips i ON i.endpoint = e.id

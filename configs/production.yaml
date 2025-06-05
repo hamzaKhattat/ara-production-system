@@ -4,15 +4,15 @@ app:
   name: asterisk-ara-router
   version: 2.0.0
   environment: production
-  debug: false
+  debug: true
 
 database:
   driver: mysql
-  host: ${DB_HOST:localhost}
-  port: ${DB_PORT:3306}
-  username: ${DB_USER:asterisk}
-  password: ${DB_PASS:asterisk_secure_pass}
-  database: ${DB_NAME:asterisk_ara}
+  host: localhost
+  port: 3306
+  username: root
+  password: temppass
+  database: asterisk_ara
   max_open_conns: 25
   max_idle_conns: 5
   conn_max_lifetime: 5m
@@ -82,7 +82,7 @@ monitoring:
     readiness_path: /health/ready
     
   logging:
-    level: ${LOG_LEVEL:info}
+    level: info
     format: json
     output: stdout
     file:
