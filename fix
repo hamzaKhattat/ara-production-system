@@ -1,0 +1,168 @@
+#!/bin/bash
+# fix-pjsip-ara-endpoint-identification.sh
+# Comprehensive fix for PJSIP endpoint identification with ARA
+
+echo "=== Fixing PJSIP ARA Endpoint Identification ==="
+
+# Step 1: Backup existing configuration
+echo "1. Backing up existing configuration..."
+mkdir -p /etc/asterisk/backup_$(date +%Y%m%d_%H%M%S)
+cp /etc/asterisk/pjsip*.conf /etc/asterisk/backup_$(date +%Y%m%d_%H%M%S)/
+cp /etc/asterisk/sorcery.conf /etc/asterisk/backup_$(date +%Y%m%d_%H%M%S)/
+
+# Step 2: Remove conflicting pjsip configuration files
+echo "2. Removing conflicting static pjsip configuration files..."
+rm -f /etc/asterisk/pjsip_provider*.conf
+rm -f /etc/asterisk/pjsip_s*.conf
+rm -f /etc/asterisk/pjsip_wizard.conf
+rm -f /etc/asterisk/pjsip_providers.conf
+
+# Step 3: Create minimal pjsip.conf (everything else comes from ARA)
+echo "3. Creating minimal pjsip.conf..."
+cat > /etc/asterisk/pjsip.conf << 'EOF'
+; PJSIP Configuration
+; All endpoint configuration is in realtime database via ARA
+
+; This section is required to exist for the module to load
+[res_pjsip_endpoint_identifier_ip]
+; Empty section - all configuration comes from realtime
+EOF
+
+# Step 4: Update sorcery.conf with proper configuration
+echo "4. Updating sorcery.conf..."
+cat > /etc/asterisk/sorcery.conf << 'EOF'
+; Sorcery configuration for PJSIP with ODBC realtime
+
+[res_pjsip]
+endpoint=realtime,ps_endpoints
+auth=realtime,ps_auths
+aor=realtime,ps_aors
+domain_alias=realtime,ps_domain_aliases
+contact=realtime,ps_contacts
+identify=realtime,ps_endpoint_id_ips
+transport=realtime,ps_transports
+system=realtime,ps_systems
+global=realtime,ps_globals
+
+[res_pjsip_endpoint_identifier_ip]
+identify=realtime,ps_endpoint_id_ips
+EOF
+
+# Step 5: Update modules.conf to ensure proper load order
+echo "5. Updating modules.conf..."
+cat > /etc/asterisk/modules.conf << 'EOF'
+[modules]
+autoload=yes
+
+; Preload requirements
+preload => res_odbc.so
+preload => res_config_odbc.so
+
+; Core PJSIP modules in correct order
+load => res_pjsip.so
+load => res_pjsip_session.so
+load => res_pjsip_pubsub.so
+
+; Endpoint identifier modules - CRITICAL ORDER
+load => res_pjsip_endpoint_identifier_ip.so
+load => res_pjsip_endpoint_identifier_user.so
+load => res_pjsip_endpoint_identifier_anonymous.so
+
+; Other PJSIP modules
+load => res_pjsip_authenticator_digest.so
+load => res_pjsip_registrar.so
+load => res_pjsip_outbound_registration.so
+load => res_pjsip_transport_websocket.so
+load => res_pjsip_t38.so
+load => res_pjsip_dtmf_info.so
+load => res_pjsip_diversion.so
+load => res_pjsip_path.so
+load => res_pjsip_caller_id.so
+load => res_pjsip_messaging.so
+load => res_pjsip_mwi.so
+load => res_pjsip_notify.so
+load => res_pjsip_one_touch_record_info.so
+load => res_pjsip_outbound_authenticator_digest.so
+load => res_pjsip_pubsub.so
+load => res_pjsip_refer.so
+load => res_pjsip_registrar.so
+load => res_pjsip_rfc3326.so
+load => res_pjsip_sdp_rtp.so
+load => res_pjsip_send_to_voicemail.so
+load => res_pjsip_xpidf_body_generator.so
+load => chan_pjsip.so
+
+; Explicitly noload MySQL since we use ODBC
+noload => res_config_mysql.so
+EOF
+
+# Step 6: Fix the ps_endpoint_id_ips entries to use proper format
+echo "6. Fixing ps_endpoint_id_ips entries..."
+mysql -uroot -ptemppass asterisk_ara << 'SQL'
+-- First, let's see what we currently have
+SELECT * FROM ps_endpoint_id_ips;
+
+-- Update the entries to ensure they work correctly
+-- Remove the /32 entries and keep only the plain IP addresses
+DELETE FROM ps_endpoint_id_ips WHERE `match` LIKE '%/32';
+
+-- Ensure srv_lookups is set to 'yes' for all entries
+UPDATE ps_endpoint_id_ips SET srv_lookups = 'yes';
+
+-- Show the updated entries
+SELECT * FROM ps_endpoint_id_ips;
+SQL
+
+# Step 7: Update the ps_globals endpoint_identifier_order
+echo "7. Updating ps_globals endpoint_identifier_order..."
+mysql -uroot -ptemppass asterisk_ara << 'SQL'
+UPDATE ps_globals 
+SET endpoint_identifier_order = 'ip,username,anonymous' 
+WHERE id = 'global';
+SQL
+
+# Step 8: Create a test script to verify endpoint identification
+echo "8. Creating verification script..."
+cat > /tmp/verify_endpoint_identification.sh << 'EOF'
+#!/bin/bash
+echo "=== Verifying Endpoint Identification ==="
+
+# Check if module is loaded
+echo "1. Checking if res_pjsip_endpoint_identifier_ip is loaded:"
+asterisk -rx "module show like endpoint_identifier_ip"
+
+# Check sorcery memory cache
+echo -e "\n2. Checking sorcery memory cache for identify objects:"
+asterisk -rx "pjsip show identifies"
+
+# Check endpoints
+echo -e "\n3. Checking endpoints:"
+asterisk -rx "pjsip show endpoints"
+
+# Check database entries
+echo -e "\n4. Database ps_endpoint_id_ips entries:"
+mysql -uroot -ptemppass asterisk_ara -e "SELECT * FROM ps_endpoint_id_ips;"
+
+# Check recent logs
+echo -e "\n5. Recent relevant log entries:"
+tail -20 /var/log/asterisk/full | grep -E "(endpoint|identify|OPTIONS)"
+EOF
+chmod +x /tmp/verify_endpoint_identification.sh
+
+# Step 9: Restart Asterisk with clean state
+echo "9. Restarting Asterisk..."
+systemctl stop asterisk
+sleep 2
+# Clear any cached state
+rm -f /var/cache/asterisk/*
+systemctl start asterisk
+sleep 5
+
+# Step 10: Run verification
+echo "10. Running verification..."
+/tmp/verify_endpoint_identification.sh
+
+echo "=== Fix Complete ==="
+echo "If endpoints are still showing as 'Unavailable', try these commands:"
+echo "  asterisk -rx 'pjsip reload'"
+echo "  asterisk -rx 'module reload res_pjsip_endpoint_identifier_ip.so'"

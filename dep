@@ -1,0 +1,35 @@
+#!/bin/bash
+# /root/ara-production-system/scripts/rebuild_asterisk_pjsip.sh
+
+# Install dependencies
+apt-get update
+apt-get install -y build-essential wget libssl-dev libncurses5-dev \
+    libnewt-dev libxml2-dev libsqlite3-dev uuid-dev \
+    libjansson-dev libcurl4-openssl-dev libedit-dev
+
+# Download and compile PJPROJECT
+cd /usr/src
+wget https://github.com/pjsip/pjproject/archive/2.14.1.tar.gz
+tar -xzf 2.14.1.tar.gz
+cd pjproject-2.14.1
+
+./configure --prefix=/usr --enable-shared --disable-sound \
+    --disable-resample --disable-video --disable-opencore-amr \
+    CFLAGS='-O2 -DNDEBUG -DPJ_HAS_SSL_SOCK=1'
+
+make dep
+make
+make install
+ldconfig
+
+# Recompile Asterisk
+cd /usr/src/asterisk-22.4.0
+./configure --with-pjproject-bundled=no
+make menuselect
+
+# Ensure res_pjsip modules are selected
+make
+make install
+
+# Restart and test
+systemctl restart asterisk

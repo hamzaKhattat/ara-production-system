@@ -1,4 +1,4 @@
-# Production Configuration for ARA Router
+# Asterisk ARA Router Production Configuration
 
 app:
   name: asterisk-ara-router
@@ -13,43 +13,58 @@ database:
   username: root
   password: temppass
   database: asterisk_ara
-  max_open_conns: 25
-  max_idle_conns: 5
+  max_open_conns: 100
+  max_idle_conns: 10
   conn_max_lifetime: 5m
   retry_attempts: 3
   retry_delay: 1s
+  charset: utf8mb4
 
 redis:
-  host: ${REDIS_HOST:localhost}
-  port: ${REDIS_PORT:6379}
-  password: ${REDIS_PASS:}
+  host: localhost
+  port: 6379
+  password: ""
   db: 0
-  pool_size: 10
+  pool_size: 20
   min_idle_conns: 5
   max_retries: 3
+  dial_timeout: 5s
+  read_timeout: 3s
+  write_timeout: 3s
+  pool_timeout: 4s
+  idle_timeout: 5m
 
 agi:
   listen_address: 0.0.0.0
-  port: ${AGI_PORT:4573}
+  port: 4573
   max_connections: 1000
   read_timeout: 30s
   write_timeout: 30s
   idle_timeout: 120s
   shutdown_timeout: 30s
+  buffer_size: 4096
+  enable_tls: false
 
 asterisk:
   ami:
-    host: ${AMI_HOST:localhost}
-    port: ${AMI_PORT:5038}
-    username: ${AMI_USER:admin}
-    password: ${AMI_PASS:admin_secure_pass}
+    enabled: true
+    host: localhost
+    port: 5038
+    username: routerami
+    password: routerpass
     reconnect_interval: 5s
     ping_interval: 30s
-  
+    action_timeout: 10s
+    connect_timeout: 10s
+    event_buffer_size: 1000
   ara:
     transport_reload_interval: 60s
     endpoint_cache_ttl: 300s
     dialplan_cache_ttl: 600s
+    aor_cache_ttl: 300s
+    auth_cache_ttl: 300s
+    enable_cache: true
+    sync_interval: 60s
 
 router:
   did_allocation_timeout: 5s
@@ -57,58 +72,91 @@ router:
   stale_call_timeout: 30m
   max_retries: 3
   retry_backoff: exponential
-  
   verification:
     enabled: true
-    strict_mode: true
+    strict_mode: false
     log_failures: true
-  
+    timeout: 5s
   recording:
     enabled: true
     path: /var/spool/asterisk/monitor
     format: wav
     mix_type: both
+    max_size: 0
+    max_age: 30
+  load_balancer:
+    default_mode: round_robin
+    health_check_interval: 30s
+    failover_timeout: 5s
+    max_failures: 3
+    recovery_time: 5m
 
 monitoring:
   metrics:
     enabled: true
-    port: ${METRICS_PORT:9090}
+    port: 9090
     path: /metrics
-    
+    namespace: ara_router
+    subsystem: ""
+    collect_interval: 10s
   health:
     enabled: true
-    port: ${HEALTH_PORT:8080}
+    port: 8080
     liveness_path: /health/live
     readiness_path: /health/ready
-    
+    check_interval: 30s
+    check_timeout: 5s
   logging:
     level: info
     format: json
     output: stdout
     file:
       enabled: true
-      path: /var/log/asterisk-router/router.log
-      max_size: 100M
-      max_backups: 10
+      path: /var/log/asterisk/ara-router.log
+      max_size: 100
+      max_backups: 5
       max_age: 30
       compress: true
+    fields:
+      service: ara-router
+      environment: production
+  tracing:
+    enabled: false
+    provider: jaeger
+    endpoint: http://localhost:14268/api/traces
+    service_name: ara-router
+    sample_rate: 0.1
 
 security:
   tls:
-    enabled: ${TLS_ENABLED:false}
-    cert_file: ${TLS_CERT:}
-    key_file: ${TLS_KEY:}
-    ca_file: ${TLS_CA:}
-  
+    enabled: false
+    cert_file: ""
+    key_file: ""
+    ca_file: ""
+    insecure_skip_verify: false
+    min_version: "1.2"
+    cipher_suites: []
   api:
     enabled: true
-    port: ${API_PORT:8081}
-    auth_token: ${API_TOKEN:}
+    port: 8081
+    auth_token: ""
     rate_limit: 100
     cors_enabled: true
+    cors_origins:
+      - "*"
+    read_timeout: 30s
+    write_timeout: 30s
+  rate_limit:
+    enabled: true
+    requests_per_min: 1000
+    burst_size: 100
+    cleanup_interval: 1m
 
 performance:
-  worker_pool_size: ${WORKER_POOL_SIZE:100}
-  queue_size: ${QUEUE_SIZE:1000}
+  worker_pool_size: 100
+  queue_size: 1000
   batch_size: 50
   gc_interval: 1m
+  max_procs: 0
+  enable_profiling: false
+  profiling_port: 6060

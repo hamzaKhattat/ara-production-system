@@ -3,7 +3,6 @@ package ara
 import (
     "context"
     "database/sql"
-//    "encoding/json"
     "fmt"
     "strings"
     "time"
@@ -30,7 +29,6 @@ func NewManager(db *sql.DB, cache CacheInterface) *Manager {
         cache: cache,
     }
 }
-
 
 func (m *Manager) CreateEndpoint(ctx context.Context, provider *models.Provider) error {
     log := logger.WithContext(ctx)
@@ -86,6 +84,14 @@ func (m *Manager) CreateEndpoint(ctx context.Context, provider *models.Provider)
     // Determine context based on provider type
     context := fmt.Sprintf("from-provider-%s", provider.Type)
     
+    // CRITICAL: Set identify_by correctly based on auth type
+    identifyBy := "username"
+    if provider.AuthType == "ip" {
+        identifyBy = "ip"
+    } else if provider.AuthType == "both" {
+        identifyBy = "username,ip"
+    }
+    
     // Build endpoint query
     endpointQuery := `
         INSERT INTO ps_endpoints (
@@ -93,13 +99,13 @@ func (m *Manager) CreateEndpoint(ctx context.Context, provider *models.Provider)
             disallow, allow, direct_media, trust_id_inbound, trust_id_outbound,
             send_pai, send_rpid, rtp_symmetric, force_rport, rewrite_contact,
             timers, timers_min_se, timers_sess_expires, dtmf_mode,
-            media_encryption, rtp_timeout, rtp_timeout_hold
+            media_encryption, rtp_timeout, rtp_timeout_hold, identify_by
         ) VALUES (
             ?, 'transport-udp', ?, ?, ?,
             'all', ?, 'no', 'yes', 'yes',
             'yes', 'yes', 'yes', 'yes', 'yes',
             'yes', 90, 1800, 'rfc4733',
-            'no', 120, 60
+            'no', 120, 60, ?
         )
         ON DUPLICATE KEY UPDATE
             transport = VALUES(transport),
@@ -107,32 +113,43 @@ func (m *Manager) CreateEndpoint(ctx context.Context, provider *models.Provider)
             auth = VALUES(auth),
             context = VALUES(context),
             allow = VALUES(allow),
-            direct_media = VALUES(direct_media)`
+            direct_media = VALUES(direct_media),
+            identify_by = VALUES(identify_by)`
     
     authRef := ""
     if provider.AuthType == "credentials" || provider.AuthType == "both" {
         authRef = authID
     }
     
-    if _, err := tx.ExecContext(ctx, endpointQuery, endpointID, aorID, authRef, context, codecs); err != nil {
+    if _, err := tx.ExecContext(ctx, endpointQuery, endpointID, aorID, authRef, context, codecs, identifyBy); err != nil {
         return errors.Wrap(err, errors.ErrDatabase, "failed to create endpoint")
     }
     
     // Create IP-based authentication if needed
     if provider.AuthType == "ip" || provider.AuthType == "both" {
+        // Remove any existing entries first
+        deleteQuery := `DELETE FROM ps_endpoint_id_ips WHERE endpoint = ?`
+        if _, err := tx.ExecContext(ctx, deleteQuery, endpointID); err != nil {
+            log.WithError(err).Warn("Failed to delete existing IP identifiers")
+        }
+        
         ipQuery := `
-            INSERT INTO ps_endpoint_id_ips (id, endpoint, ` + "`match`" + `)
-            VALUES (?, ?, ?)
-            ON DUPLICATE KEY UPDATE
-                endpoint = VALUES(endpoint),
-                ` + "`match`" + ` = VALUES(` + "`match`" + `)`
+            INSERT INTO ps_endpoint_id_ips (id, endpoint, ` + "`match`" + `, srv_lookups)
+            VALUES (?, ?, ?, 'yes')`
         
         ipID := fmt.Sprintf("ip-%s", provider.Name)
-        match := fmt.Sprintf("%s/32", provider.Host)
+        // Use just the IP address without CIDR notation for exact match
+        match := provider.Host
         
         if _, err := tx.ExecContext(ctx, ipQuery, ipID, endpointID, match); err != nil {
             return errors.Wrap(err, errors.ErrDatabase, "failed to create IP auth")
         }
+        
+        log.WithFields(map[string]interface{}{
+            "endpoint": endpointID,
+            "ip_match": match,
+            "identify_by": identifyBy,
+        }).Debug("Created IP identifier")
     }
     
     // Commit transaction
@@ -147,10 +164,12 @@ func (m *Manager) CreateEndpoint(ctx context.Context, provider *models.Provider)
         "provider": provider.Name,
         "auth_type": provider.AuthType,
         "endpoint_id": endpointID,
+        "identify_by": identifyBy,
     }).Info("ARA endpoint created/updated")
     
     return nil
 }
+
 // DeleteEndpoint removes PJSIP endpoint from ARA
 func (m *Manager) DeleteEndpoint(ctx context.Context, providerName string) error {
     tx, err := m.db.BeginTx(ctx, nil)
@@ -309,7 +328,7 @@ func (m *Manager) CreateDialplan(ctx context.Context) error {
         return errors.Wrap(err, errors.ErrDatabase, "failed to commit dialplan")
     }
     
-    // Clear dialplan cache - using Delete with pattern
+    // Clear dialplan cache
     m.cache.Delete(ctx, "dialplan:*")
     
     log.Info("Dialplan created successfully in ARA")
@@ -346,6 +365,7 @@ func (m *Manager) insertExtensions(tx *sql.Tx, context string, extensions []Dial
     
     return nil
 }
+
 func (m *Manager) GetEndpoint(ctx context.Context, name string) (*Endpoint, error) {
     cacheKey := fmt.Sprintf("endpoint:%s", name)
     
